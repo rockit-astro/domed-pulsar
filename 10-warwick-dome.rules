@@ -1,0 +1,1 @@
+SUBSYSTEM=="tty", ATTRS{idVendor}=="3592", ATTRS{idProduct}=="03e9",  SYMLINK="dome", MODE="0666"

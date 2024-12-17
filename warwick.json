@@ -1,0 +1,14 @@
+{
+  "daemon": "warwick_heliostat_dome",
+  "log_name": "dome@warwick_heliostat",
+  "control_machines": ["WarwickHeliostatDome", "WarwickTCS"],
+  "serial_port": "/dev/dome",
+  "serial_baud": 115200,
+  "serial_timeout": 3,
+  "serial_retries": 5,
+  "park_azimuth": 140,
+  "idle_loop_delay": 10,
+  "moving_loop_delay": 1,
+  "azimuth_move_timeout": 180,
+  "shutter_move_timeout": 180
+}
