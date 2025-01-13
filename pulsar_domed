@@ -40,8 +40,13 @@ class DomeDaemon:
         self._state_lock = threading.RLock()
         self._state_date = None
         self._azimuth_status = AzimuthStatus.Disconnected
-        self._shutter_status = ShutterStatus.Disconnected
         self._azimuth = 0
+
+        self._shutter_status = ShutterStatus.Disconnected
+        self._shutter_battery_fraction = 0
+        self._shutter_battery_voltage = 0
+        self._battery_current = 0
+        self._shutter_battery_temperature = 0
 
         self._heartbeat_status = HeartbeatStatus.Disabled
         self._heartbeat_expires = None
@@ -177,14 +182,26 @@ class DomeDaemon:
         if self._port is None:
             return
 
-        # Shutter moving?
+        battery_fraction = 0
+        battery_voltage = 0
+        battery_current = 0
+        battery_temperature = 0
+
         shutter_connected = int(self.send_command('BBOND', has_response=True)) != 0
-        if not shutter_connected:
+        if shutter_connected:
+            shutter_status = int(self.send_command('SHUTTER', has_response=True))
+            battery = self.send_command('BAT', has_response=True).split()
+            if len(battery) == 4:
+                battery_fraction = float(battery[0]) / 1000.
+                battery_voltage = float(battery[1]) / 1000.
+                battery_current = float(battery[3]) / 1000.
+                battery_temperature = float(battery[2]) / 1000.
+        else:
             print('Reconnecting to shutter')
             self.send_command('BBOND 1', has_response=True)
+            shutter_status = ShutterStatus.Disconnected
 
         azimuth_status = AzimuthStatus.Idle
-        shutter_status = int(self.send_command('SHUTTER', has_response=True))
         azimuth_degs = float(self.send_command('ANGLE', has_response=True))
         movement = int(self.send_command('MSTATE', has_response=True))
 
@@ -201,9 +218,14 @@ class DomeDaemon:
 
         with self._state_lock:
             self._state_date = Time.now()
-            self._shutter_status = shutter_status
             self._azimuth = azimuth_degs
             self._azimuth_status = azimuth_status
+
+            self._shutter_status = shutter_status
+            self._shutter_battery_fraction = battery_fraction
+            self._shutter_battery_voltage = battery_voltage
+            self._battery_current = battery_current
+            self._shutter_battery_temperature = battery_temperature
 
             if shutter_status == ShutterStatus.Closed and self._heartbeat_status == HeartbeatStatus.TrippedClosing:
                 self._heartbeat_status = HeartbeatStatus.TrippedIdle
@@ -523,6 +545,14 @@ class DomeDaemon:
                 'heartbeat_status': self._heartbeat_status,
                 'heartbeat_status_label': HeartbeatStatus.label(self._heartbeat_status),
             })
+
+            if self._shutter_status != ShutterStatus.Disconnected:
+                data.update({
+                    'shutter_battery_fraction': self._shutter_battery_fraction,
+                    'shutter_battery_voltage': self._shutter_battery_voltage,
+                    'shutter_battery_current': self._battery_current,
+                    'shutter_battery_temperature': self._shutter_battery_temperature
+                })
 
             if self._heartbeat_expires is not None:
                 data['heartbeat_remaining'] = max((self._heartbeat_expires - Time.now()).to_value(u.s), 0)

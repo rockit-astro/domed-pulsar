@@ -78,7 +78,10 @@ def print_status(config, _):
 
     print(azimuth_label)
 
-    print(f'    Shutter: {ShutterStatus.label(status["shutter"], formatting=True)}')
+    shutter_label = f'    Shutter: {ShutterStatus.label(status["shutter"], formatting=True)}'
+    if 'shutter_battery_fraction' in status:
+        shutter_label += ' (Battery [b]{status["shutter_battery_fraction"] * 100:.1f}%[/b], [b]{status["shutter_battery_current"]:.1f} mA[/b])'
+    print(shutter_label)
 
     eng_mode = '[red]ENABLED[/red]' if status['engineering_mode'] else '[green]DISABLED[/green]'
     print(f'  Eng. mode: [b]{eng_mode}[/b]')
