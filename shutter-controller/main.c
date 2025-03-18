@@ -135,7 +135,7 @@ void poll_serial(void)
             state = current_direction;
         else if (current_flags & FLAG_LIMIT_OPEN)
             state = DIR_OPEN + 2;
-        else if (current_flags & FLAG_LIMIT_OPEN)
+        else if (current_flags & FLAG_LIMIT_CLOSED)
             state = DIR_CLOSE + 2;
         
         snprintf(output_buffer, 16, "%02d,%03d\r\n", state, heartbeat);
