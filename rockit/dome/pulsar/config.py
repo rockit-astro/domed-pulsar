@@ -25,8 +25,11 @@ CONFIG_SCHEMA = {
     'type': 'object',
     'additionalProperties': False,
     'required': [
-        'daemon', 'log_name', 'control_machines', 'serial_port', 'serial_baud', 'serial_timeout', 'serial_retries',
-        'park_azimuth', 'idle_loop_delay', 'moving_loop_delay', 'azimuth_move_timeout', 'shutter_move_timeout',
+        'daemon', 'log_name', 'control_machines',
+        'azimuth_serial_port', 'azimuth_serial_baud', 'azimuth_serial_timeout',
+        'shutter_serial_port', 'shutter_serial_baud', 'shutter_serial_timeout',
+        'azimuth_loop_delay', 'azimuth_moving_loop_delay', 'home_azimuth', 'park_azimuth',
+        'azimuth_move_timeout', 'shutter_move_timeout',
     ],
     'properties': {
         'daemon': {
@@ -43,33 +46,49 @@ CONFIG_SCHEMA = {
                 'machine_name': True
             }
         },
-        'serial_port': {
+        'azimuth_serial_port': {
             'type': 'string'
         },
-        'serial_baud': {
+        'azimuth_serial_baud': {
             'type': 'integer',
             'minimum': 115200,
             'maximum': 115200
         },
-        'serial_timeout': {
+        'azimuth_serial_timeout': {
             'type': 'number',
             'minimum': 0
         },
-        'serial_retries': {
+        'azimuth_serial_retries': {
+            'type': 'number',
+            'minimum': 0
+        },
+        'shutter_serial_port': {
+            'type': 'string'
+        },
+        'shutter_serial_baud': {
+            'type': 'integer',
+            'minimum': 4800,
+            'maximum': 4800
+        },
+        'shutter_serial_timeout': {
+            'type': 'number',
+            'minimum': 0
+        },
+        'azimuth_loop_delay': {
+            'type': 'number',
+            'min': 0
+        },
+        'azimuth_moving_loop_delay': {
+            'type': 'number',
+            'min': 0
+        },
+        'home_azimuth': {
             'type': 'number',
             'minimum': 0
         },
         'park_azimuth': {
             'type': 'number',
             'minimum': 0
-        },
-        'idle_loop_delay': {
-            'type': 'number',
-            'min': 0
-        },
-        'moving_loop_delay': {
-            'type': 'number',
-            'min': 0
         },
         'azimuth_move_timeout': {
             'type': 'number',
@@ -98,12 +117,15 @@ class Config:
         self.daemon = getattr(daemons, config_json['daemon'])
         self.log_name = config_json['log_name']
         self.control_ips = [getattr(IP, machine) for machine in config_json['control_machines']]
-        self.serial_port = config_json['serial_port']
-        self.serial_baud = config_json['serial_baud']
-        self.serial_timeout = config_json['serial_timeout']
-        self.serial_retries = config_json['serial_retries']
+        self.azimuth_serial_port = config_json['azimuth_serial_port']
+        self.azimuth_serial_baud = config_json['azimuth_serial_baud']
+        self.azimuth_serial_timeout = config_json['azimuth_serial_timeout']
+        self.shutter_serial_port = config_json['shutter_serial_port']
+        self.shutter_serial_baud = config_json['shutter_serial_baud']
+        self.shutter_serial_timeout = config_json['shutter_serial_timeout']
+        self.home_azimuth = config_json['home_azimuth']
         self.park_azimuth = config_json['park_azimuth']
-        self.idle_loop_delay = int(config_json['idle_loop_delay'])
-        self.moving_loop_delay = int(config_json['moving_loop_delay'])
+        self.azimuth_loop_delay = float(config_json['azimuth_loop_delay'])
+        self.azimuth_moving_loop_delay = float(config_json['azimuth_moving_loop_delay'])
         self.azimuth_move_timeout = int(config_json['azimuth_move_timeout'])
         self.shutter_move_timeout = int(config_json['shutter_move_timeout'])
