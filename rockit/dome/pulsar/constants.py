@@ -99,26 +99,24 @@ class AzimuthStatus:
 
 class ShutterStatus:
     """Status of the dome shutter"""
-    Open, Closed, Opening, Closing, Error, Unknown, Disconnected = range(7)
+    PartOpen, Open, Closed, Opening, Closing, Disconnected = range(6)
 
     _labels = {
-        0: 'OPEN',
-        1: 'CLOSED',
-        2: 'OPENING',
-        3: 'CLOSING',
-        4: 'ERROR',
-        5: 'UNKNOWN',
-        6: 'DISCONNECTED',
+        0: 'PART OPEN',
+        1: 'OPEN',
+        2: 'CLOSED',
+        3: 'OPENING',
+        4: 'CLOSING',
+        5: 'DISCONNECTED',
     }
 
     _colors = {
-        0: 'green',
-        1: 'red',
-        2: 'yellow',
+        0: 'cyan',
+        1: 'green',
+        2: 'red',
         3: 'yellow',
-        4: 'red',
+        4: 'yellow',
         5: 'red',
-        6: 'red',
     }
 
     @classmethod
@@ -136,23 +134,20 @@ class ShutterStatus:
             return cls._labels[status]
         return 'UNKNOWN'
 
-
 class HeartbeatStatus:
-    """Status of the dome heartbeat monitoring"""
-    Disabled, Active, TrippedClosing, TrippedIdle = range(4)
+    """Status of the heartbeat monitoring"""
+    Disabled, Active, TimedOut = range(3)
 
     _labels = {
         0: 'DISABLED',
         1: 'ACTIVE',
-        2: 'CLOSING DOME',
-        3: 'TRIPPED'
+        2: 'TIMED OUT'
     }
 
     _colors = {
         0: 'default',
         1: 'green',
-        2: 'red',
-        3: 'red'
+        2: 'red'
     }
 
     @classmethod
