@@ -111,16 +111,21 @@ void poll_serial(void)
             // Clear the sticky trigger flag when disabling the heartbeat
             // Also stops an active close
             case 0:
+                cli();
                 heartbeat_triggered = false;
+                heartbeat_seconds_remaining = 0;
                 requested_direction = DIR_STOPPED;
-                break;
+                sei();
+            break;
 
             // Reset the heartbeat timer
             default:
                 // If the heatbeat has triggered the status must be manually
                 // cleared by sending a 0 byte
+                cli();
                 if (!heartbeat_triggered && value <= 240)
                     heartbeat_seconds_remaining = value;
+                sei();
         }
     }
 
