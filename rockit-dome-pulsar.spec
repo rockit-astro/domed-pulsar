@@ -1,6 +1,6 @@
 Name:      rockit-dome-pulsar
 Version:   %{_version}
-Release:   1
+Release:   1%{dist}
 Summary:   Pulsar dome daemon
 Url:       https://github.com/rockit-astro/domed-pulsar
 License:   GPL-3.0

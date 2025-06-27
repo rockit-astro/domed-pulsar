@@ -1,6 +1,6 @@
 Name:           python3-rockit-dome-pulsar
 Version:        %{_version}
-Release:        1
+Release:        1%{dist}
 License:        GPL3
 Summary:        Common backend code for the pulsar dome daemon.
 Url:            https://github.com/rockit-astro/domed-pulsar
