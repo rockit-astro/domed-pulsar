@@ -32,8 +32,7 @@ class CommandStatus:
     HeartbeatTimedOut = 13
     HeartbeatCloseInProgress = 14
     HeartbeatInvalidTimeout = 16
-    EngineeringModeRequiresHeartbeatDisabled = 17
-    EngineeringModeActive = 18
+    FollowModeActive = 19
 
     _messages = {
         # General error codes

@@ -15,16 +15,21 @@
 # You should have received a copy of the GNU General Public License
 # along with rockit.  If not, see <http://www.gnu.org/licenses/>.
 
-"""Ash dome daemon"""
+"""Pulsar dome daemon"""
 
 import argparse
+import queue
 import re
+import sys
 import threading
+import traceback
 import time
 import Pyro4
 import serial
+from astropy.coordinates import AltAz, EarthLocation, SkyCoord
 from astropy.time import Time
 import astropy.units as u
+import numpy as np
 from rockit.common import log, TryLock
 from rockit.common.helpers import pyro_client_matches
 from rockit.dome.pulsar import Config, CommandStatus, AzimuthStatus, ShutterStatus, HeartbeatStatus
@@ -36,16 +41,23 @@ class DomeDaemon:
     """Daemon class that wraps the USB-serial interface"""
     def __init__(self, config):
         self._config = config
+        self._location = EarthLocation(
+            lat=config.latitude*u.deg,
+            lon=config.longitude*u.deg,
+            height=config.altitude*u.m)
+
         self._azimuth_port = None
         self._azimuth_port_error = False
-        self._azimuth_port_lock = threading.Lock()
-        self._azimuth_status_condition = threading.Condition()
-        self._azimuth_status_lock = threading.Lock()
+        self._azimuth_status_lock = threading.RLock()
         self._azimuth_status_time = Time.now()
         self._azimuth_status = AzimuthStatus.Disconnected
         self._azimuth = 0
         self._azimuth_command_lock = threading.Lock()
+        self._azimuth_command_queue = queue.Queue()
+        self._azimuth_result_queue = queue.Queue()
         self._azimuth_move_complete_condition = threading.Condition()
+        self._azimuth_tracking_coord = None
+        self._azimuth_follow_telescope = True
 
         self._shutter_port = None
         self._shutter_port_error = False
@@ -54,103 +66,251 @@ class DomeDaemon:
         self._shutter_status = ShutterStatus.Disconnected
         self._shutter_command_lock = threading.Lock()
         self._shutter_move_complete_condition = threading.Condition()
-
         self._heartbeat_status = HeartbeatStatus.Disabled
         self._heartbeat_seconds_remaining = 0
 
         self._force_stopped = False
-        self._engineering_mode = False
 
         threading.Thread(target=self.__azimuth_thread, daemon=True).start()
         threading.Thread(target=self.__shutter_thread, daemon=True).start()
 
-    def __azimuth_thread(self):
-        """Monitors the status of the azimuth controller"""
+    def wait_until_azimuth_idle(self, timeout_seconds):
+        """
+        Block until a given condition returns true or a timeout occurs.
+        Returns True on complete, False on timeout or disconnection
+        """
+
+        start = Time.now()
         while True:
-            # Initial setup
-            try:
-                self._azimuth_port = serial.Serial(self._config.azimuth_serial_port,
-                                           self._config.azimuth_serial_baud,
-                                           rtscts=True,
-                                           timeout=self._config.azimuth_serial_timeout)
-                prefix = 'Restored' if self._azimuth_port_error else 'Established'
-                log.info(self._config.log_name, prefix + ' serial connection to azimuth drive')
-                self._azimuth_port_error = False
+            with self._azimuth_move_complete_condition:
+                self._azimuth_move_complete_condition.wait(1)
 
-            except Exception as exception:
-                if not self._azimuth_port_error:
-                    log.error(self._config.log_name, 'Lost serial connection to azimuth drive')
-                    print('Failed to connect to azimuth drive (' + str(exception) + ')')
-                self._azimuth_port_error = True
-                time.sleep(5.)
-                continue
+            if self._azimuth_status == AzimuthStatus.Idle:
+                return True
 
-            try:
-                with self._azimuth_status_lock:
-                    self._azimuth_status_time = Time.now()
-                    self._azimuth_status = AzimuthStatus.NotHomed
+            if self._azimuth_port is None:
+                return False
 
-                with self._azimuth_port_lock:
+            if Time.now() > start + timeout_seconds * u.s:
+                return False
+
+    def _offset_azimuth(self, altitude, azimuth):
+        """
+        Evaluates the dome azimuth required to center a given telescope
+        azimuth in the slit. Corrects for the fact that the telescope
+        dec axis is not in the middle of the dome.
+        """
+
+        # Decompose the requested az into x (south) and y (east) coords
+        x = self._config.dome_radius_cm * np.cos(np.radians(azimuth)) * np.cos(np.radians(altitude))
+        y = self._config.dome_radius_cm * np.sin(np.radians(azimuth)) * np.cos(np.radians(altitude))
+
+        # Find the vector from the telescope to the radius of the dome
+        delta_x = x - self._config.telescope_offset_x_cm
+        delta_y = y
+
+        corrected_az = np.degrees(np.arctan2(delta_y, delta_x))
+        if corrected_az < 0:
+            corrected_az += 360
+
+        return corrected_az
+
+    def _altaz_to_dome_azimuth(self, coord, time):
+        """
+        Evaluates the dome azimuth required to track
+        a given ra,dec coordinate at a given time.
+        """
+        frame = AltAz(obstime=time, location=self._location)
+        altaz = coord.transform_to(frame)
+        return self._offset_azimuth(altaz.alt.to_value(u.deg), altaz.az.to_value(u.deg))
+
+    def __azimuth_thread(self):
+        delay = self._config.azimuth_loop_delay
+
+        def update_state():
+            """Request and parse the status of the dome motors"""
+            if self._azimuth_port is None:
+                return
+
+            self._azimuth_port.write(b'V\r')
+
+            # Controller sometimes stalls in the middle of responding
+            # Make sure we assemble the full response before continuing
+            response = b''
+            for i in range(13):
+                char = serial.CR if i == 12 else b'\t'
+                response += self._azimuth_port.read_until(char)
+
+            fields = response.decode('ascii').split('\t')
+            azimuth = float(fields[0])
+            target_azimuth = float(fields[3])
+            mstate = int(fields[1])
+
+            azimuth_status = AzimuthStatus.Idle
+
+            # Motor often stalls within 1 deg of the target, so allow some slop
+            if mstate not in [0, 3] and (mstate == 9 or abs(target_azimuth - azimuth) > 1):
+                # Azimuth is moving
+                if self._azimuth_status == AzimuthStatus.Homing:
+                    azimuth_status = AzimuthStatus.Homing
+                else:
+                    azimuth_status = AzimuthStatus.Moving
+            else:
+                # Azimuth is stationary
+                if self._azimuth_status == AzimuthStatus.NotHomed:
+                    azimuth_status = AzimuthStatus.NotHomed
+
+            with self._azimuth_status_lock:
+                self._azimuth_status_time = Time.now()
+                self._azimuth = azimuth
+                self._azimuth_status = azimuth_status
+
+        def process_request(request, data):
+            """
+            Process a command sent by the user
+            Returns a CommandStatus that is pushed to the results queue
+            """
+            if self._azimuth_port is None:
+                return CommandStatus.NotConnected
+
+            if request in ['home_azimuth', 'slew_azimuth'] and \
+                    self._azimuth_status in [AzimuthStatus.Moving, AzimuthStatus.Homing]:
+                return CommandStatus.Blocked
+
+            if request == 'stop_azimuth':
+                print('Stopping azimuth')
+                self._azimuth_tracking_coord = None
+                self._azimuth_port.write(b'STOP\r')
+                self._azimuth_port.read_until(serial.CR)
+            elif request == 'home_azimuth':
+                if self._azimuth_status == AzimuthStatus.NotHomed:
+                    print('Homing azimuth')
+                    self._azimuth_status = AzimuthStatus.Homing
+                    self._azimuth_tracking_coord = None
                     self._azimuth_port.write(f'HOME {self._config.home_azimuth:05.1f}\r'.encode('ascii'))
                     self._azimuth_port.read_until(serial.CR)
+                    self._azimuth_port.write(b'GO H\r')
+                    self._azimuth_port.read_until(serial.CR)
+            elif request == 'slew_azimuth':
+                if self._azimuth_status == AzimuthStatus.NotHomed:
+                    return CommandStatus.NotHomed
 
-                # Main run loop
-                while True:
-                    azimuth_status = AzimuthStatus.Idle
-                    with self._azimuth_port_lock:
-                        self._azimuth_port.write(b'V\r')
+                print(f'Slewing azimuth to {data:.5f}')
+                self._azimuth_status = AzimuthStatus.Moving
+                self._azimuth_port.write(f'GO {float(data):05.1f}\r'.encode('ascii'))
+                self._azimuth_port.read_until(serial.CR)
+            elif request == 'track_radec':
+                print(f'Tracking RADec {data[0]:.5f} {data[1]:.5f}')
+                self._azimuth_tracking_coord = SkyCoord(ra=data[0], dec=data[1], unit=u.deg, frame='icrs')
+                az = self._altaz_to_dome_azimuth(self._azimuth_tracking_coord, Time.now())
+                process_request('slew_azimuth', az)
+            elif request == 'slew_radec':
+                print(f'Slewing to RADec {data[0]:.5f} {data[1]:.5f}')
+                coord = SkyCoord(ra=data[0], dec=data[1], unit=u.deg, frame='icrs')
+                az = self._altaz_to_dome_azimuth(coord, Time.now())
+                self._azimuth_tracking_coord = None
+                process_request('slew_azimuth', az)
+            elif request == 'slew_altaz':
+                print(f'Slewing to AltAz {data[0]:.5f} {data[1]:.5f}')
+                az = self._offset_azimuth(data[0], data[1])
+                self._azimuth_tracking_coord = None
+                process_request('slew_azimuth', az)
+            else:
+                print(f'Unknown request `{request}`')
+                return CommandStatus.Failed
 
-                        # Controller sometimes stalls in the middle of responding
-                        # Make sure we assemble the full response before continuing
-                        response = b''
-                        for i in range(13):
-                            char = serial.CR if i == 12 else b'\t'
-                            response += self._azimuth_port.read_until(char)
+            return CommandStatus.Succeeded
 
-                    fields = response.decode('ascii').split('\t')
-                    delay = self._config.azimuth_loop_delay
-                    azimuth = float(fields[0])
-                    target_azimuth = float(fields[3])
-                    mstate = int(fields[1])
+        while True:
+            try:
+                request, data = self._azimuth_command_queue.get(timeout=delay)
+            except queue.Empty:
+                request, data = None, None
 
-                    # Motor often stalls within 1 deg of the target, so allow some slop
-                    if mstate not in [0, 3] and (mstate == 9 or abs(target_azimuth - azimuth) > 1):
-                        # Azimuth is moving
-                        delay = self._config.azimuth_moving_loop_delay
-                        if self._azimuth_status == AzimuthStatus.Homing:
-                            azimuth_status = AzimuthStatus.Homing
-                        else:
-                            azimuth_status = AzimuthStatus.Moving
-                    else:
-                        # Azimuth is stationary
-                        if self._azimuth_status == AzimuthStatus.NotHomed:
-                            azimuth_status = AzimuthStatus.NotHomed
+            # Try reconnecting if needed
+            if self._azimuth_port is None:
+                try:
+                    port = serial.Serial(self._config.azimuth_serial_port,
+                                         self._config.azimuth_serial_baud,
+                                         rtscts=True,
+                                         timeout=self._config.azimuth_serial_timeout)
+                    prefix = 'Restored' if self._azimuth_port_error else 'Established'
+                    log.info(self._config.log_name, prefix + ' serial connection to azimuth drive')
 
                     with self._azimuth_status_lock:
-                        self._azimuth_status_time = Time.now()
-                        self._azimuth = azimuth
-                        self._azimuth_status = azimuth_status
+                        self._azimuth_port = port
+                        self._azimuth = 0
+                        self._azimuth_status = AzimuthStatus.NotHomed
+                        self._azimuth_follow_telescope = True
 
-                    with self._azimuth_status_condition:
-                        self._azimuth_status_condition.wait(delay)
+                        # Refresh state before considering the connection valid
+                        update_state()
 
+                except Exception as exception:
+                    if not self._azimuth_port_error:
+                        log.error(self._config.log_name, 'Lost serial connection to azimuth drive')
+                        print('Failed to connect to azimuth drive (' + str(exception) + ')')
+                    self._azimuth_port_error = True
+
+                    delay = 10
+                    continue
+
+            result = CommandStatus.NotConnected
+            was_moving = self._azimuth_status in [AzimuthStatus.Homing, AzimuthStatus.Moving]
+            was_homing = self._azimuth_status == AzimuthStatus.Homing
+
+            try:
+                update_state()
+
+                # Slew to park position after homing
+                if was_homing and self._azimuth_status == AzimuthStatus.Idle:
+                    self._azimuth_tracking_coord = None
+                    process_request('slew_azimuth', self._config.park_azimuth)
+
+                if request is not None:
+                    result = process_request(request, data)
+
+                    # Refresh the state to ensure a valid view of the controller state before returning
+                    update_state()
+                elif self._azimuth_tracking_coord is not None and self._azimuth_status == AzimuthStatus.Idle:
+                    azimuth = self._altaz_to_dome_azimuth(self._azimuth_tracking_coord, Time.now())
+                    delta = azimuth - self._azimuth
+                    if delta < -180:
+                        delta += 360
+                    if delta > 180:
+                        delta -= 360
+
+                    print(f'Tracking delta: {delta:.1f}')
+                    if abs(delta) > self._config.tracking_max_separation:
+                        # Check the direction of motion
+                        future_azimuth = self._altaz_to_dome_azimuth(self._azimuth_tracking_coord,
+                                                                     Time.now() + 1 * u.minute)
+                        direction = 1 if future_azimuth > azimuth or future_azimuth < azimuth - 180 else -1
+
+                        az = azimuth + direction * self._config.tracking_max_separation
+                        process_request('slew_azimuth', az)
             except Exception as exception:
                 with self._azimuth_status_lock:
-                    self._azimuth_status_time = Time.now()
-                    self._azimuth_status = AzimuthStatus.Disconnected
+                    if self._azimuth_port is not None:
+                        self._azimuth_port.close()
+                        self._azimuth_port = None
 
-                with self._azimuth_port_lock:
-                    self._azimuth_port.close()
+                print(f'Failed to read serial port ({exception})')
+                log.error(self._config.log_name, 'Lost serial connection')
+                traceback.print_exc(file=sys.stdout)
+            finally:
+                if request is not None:
+                    self._azimuth_result_queue.put(result)
 
-                if not self._azimuth_port_error:
-                    log.error(self._config.log_name, 'Lost serial connection to azimuth drive')
-                    print('Lost connection to azimuth drive (' + str(exception) + ')')
+                is_moving = self._azimuth_status in [AzimuthStatus.Homing, AzimuthStatus.Moving]
+                if was_moving and not is_moving:
+                    with self._azimuth_move_complete_condition:
+                        self._azimuth_move_complete_condition.notify_all()
 
-                self._azimuth_port_error = True
-                time.sleep(5.)
+                delay = self._config.azimuth_moving_loop_delay if is_moving else self._config.azimuth_loop_delay
 
     def __shutter_thread(self):
-        """Monitors the status of the roof by reading serial port"""
+        """Monitors the status of the shutter by reading serial port"""
         shutter_regex = re.compile(SHUTTER_REGEX)
         while True:
             # Initial setup
@@ -261,9 +421,6 @@ class DomeDaemon:
         if self._shutter_status == ShutterStatus.Disconnected:
             return CommandStatus.NotConnected
 
-        if self._engineering_mode:
-            return CommandStatus.EngineeringModeActive
-
         if self._heartbeat_status == HeartbeatStatus.TimedOut:
             return CommandStatus.HeartbeatTimedOut
 
@@ -290,9 +447,6 @@ class DomeDaemon:
         if self._shutter_status == ShutterStatus.Disconnected:
             return CommandStatus.NotConnected
 
-        if self._engineering_mode:
-            return CommandStatus.EngineeringModeActive
-
         if self._heartbeat_status == HeartbeatStatus.TimedOut:
             return CommandStatus.HeartbeatTimedOut
 
@@ -308,7 +462,7 @@ class DomeDaemon:
             return CommandStatus.Succeeded
 
     @Pyro4.expose
-    def stop(self):
+    def stop_shutter(self):
         """Stops any active shutter movement"""
         if not pyro_client_matches(self._config.control_ips):
             return CommandStatus.InvalidControlIP
@@ -322,40 +476,170 @@ class DomeDaemon:
         # The stop command overrides all other commands
         self._force_stopped = True
         with self._shutter_command_lock:
-            with self._azimuth_command_lock:
-                self._force_stopped = False
+            self._force_stopped = False
 
         return CommandStatus.Succeeded
 
     @Pyro4.expose
-    def set_engineering_mode(self, enabled):
-        """Enable engineering mode (all movement commands disabled)"""
+    def stop_azimuth(self):
+        """Stops the azimuth motor"""
         if not pyro_client_matches(self._config.control_ips):
             return CommandStatus.InvalidControlIP
 
-        with TryLock(self._shutter_command_lock) as success_shutter:
-            with TryLock(self._shutter_command_lock) as success_azimuth:
-                if not success_shutter or not success_azimuth:
-                    return CommandStatus.Blocked
+        if self._azimuth_follow_telescope:
+            return CommandStatus.FollowModeActive
 
-                with self._shutter_status_lock:
-                    if self._heartbeat_status != HeartbeatStatus.Disabled:
-                        return CommandStatus.EngineeringModeRequiresHeartbeatDisabled
+        with self._azimuth_command_lock:
+            self._azimuth_command_queue.put(('stop_azimuth', None))
+            return self._azimuth_result_queue.get()
 
-                    if self._shutter_status == ShutterStatus.Closing and self._heartbeat_status == HeartbeatStatus.TimedOut:
-                        return CommandStatus.HeartbeatCloseInProgress
 
-                self._engineering_mode = enabled
-                return CommandStatus.Succeeded
+    @Pyro4.expose
+    def home_azimuth(self, blocking=True):
+        """Home the azimuth motor"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with self._azimuth_command_lock:
+            self._azimuth_command_queue.put(('home_azimuth', None))
+            result = self._azimuth_result_queue.get()
+
+        if result != CommandStatus.Succeeded:
+            return result
+
+        if blocking:
+            if not self.wait_until_azimuth_idle(self._config.azimuth_move_timeout):
+                return CommandStatus.Failed
+
+        return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def park(self, blocking=True):
+        """Slew the dome to the park position"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        if self._azimuth_follow_telescope:
+            return CommandStatus.FollowModeActive
+
+        return self.slew_azimuth(self._config.park_azimuth, blocking=blocking)
+
+    @Pyro4.expose
+    def slew_azimuth(self, azimuth, blocking=True):
+        """Slew the dome to the requested azimuth"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        if self._azimuth_follow_telescope:
+            return CommandStatus.FollowModeActive
+
+        with self._azimuth_command_lock:
+            self._azimuth_tracking_coord = None
+            self._azimuth_command_queue.put(('slew_azimuth', azimuth))
+            result = self._azimuth_result_queue.get()
+
+        if result != CommandStatus.Succeeded:
+            return result
+
+        if blocking:
+            if not self.wait_until_azimuth_idle(self._config.azimuth_move_timeout):
+                return CommandStatus.Failed
+
+        return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def track_radec(self, ra_degrees, dec_degrees, blocking=True):
+        """Align the dome slit and begin tracking the given RA and Dec"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        if self._azimuth_follow_telescope:
+            return CommandStatus.FollowModeActive
+
+        with self._azimuth_command_lock:
+            self._azimuth_command_queue.put(('track_radec', (ra_degrees, dec_degrees)))
+            result = self._azimuth_result_queue.get()
+
+        if result != CommandStatus.Succeeded:
+            return result
+
+        if blocking:
+            if not self.wait_until_azimuth_idle(self._config.azimuth_move_timeout):
+                return CommandStatus.Failed
+
+        return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def notify_telescope_radec(self, ra_degrees, dec_degrees, tracking):
+        """Notification that the telescope is moving to a new location"""
+        if not pyro_client_matches(self._config.telescope_ips):
+            return CommandStatus.InvalidControlIP
+
+        if not self._azimuth_follow_telescope:
+            return CommandStatus.Succeeded
+
+        with self._azimuth_command_lock:
+            command = 'track_radec' if tracking else 'slew_radec'
+            self._azimuth_command_queue.put((command, (ra_degrees, dec_degrees)))
+            return self._azimuth_result_queue.get()
+
+    @Pyro4.expose
+    def notify_telescope_altaz(self, alt_degrees, az_degrees):
+        """Notification that the telescope is moving to a new location"""
+        if not pyro_client_matches(self._config.telescope_ips):
+            return CommandStatus.InvalidControlIP
+
+        if not self._azimuth_follow_telescope:
+            return CommandStatus.Succeeded
+
+        with self._azimuth_command_lock:
+            self._azimuth_command_queue.put(('slew_altaz', (alt_degrees, az_degrees)))
+            return self._azimuth_result_queue.get()
+
+    @Pyro4.expose
+    def notify_telescope_stopped(self):
+        """Notification that the telescope stopped tracking"""
+        if not pyro_client_matches(self._config.telescope_ips):
+            return CommandStatus.InvalidControlIP
+
+        if not self._azimuth_follow_telescope:
+            return CommandStatus.Succeeded
+
+        with self._azimuth_command_lock:
+            self._azimuth_command_queue.put(('stop_azimuth', None))
+            return self._azimuth_result_queue.get()
+
+    @Pyro4.expose
+    def notify_telescope_parked(self):
+        """Notification that the telescope is moving to a park position"""
+        if not pyro_client_matches(self._config.telescope_ips):
+            return CommandStatus.InvalidControlIP
+
+        if not self._azimuth_follow_telescope:
+            return CommandStatus.Succeeded
+
+        with self._azimuth_command_lock:
+            self._azimuth_tracking_coord = None
+            self._azimuth_command_queue.put(('slew_azimuth', self._config.park_azimuth))
+            return self._azimuth_result_queue.get()
+
+    @Pyro4.expose
+    def set_follow_mode(self, enabled):
+        """Enable follow mode"""
+        if not pyro_client_matches(self._config.control_ips):
+            return CommandStatus.InvalidControlIP
+
+        if self._azimuth_port is None:
+            return CommandStatus.NotConnected
+
+        self._azimuth_follow_telescope = enabled
+        return CommandStatus.Succeeded
 
     @Pyro4.expose
     def set_heartbeat_timer(self, timeout):
         """Enable or disable the auto-close countdown"""
         if not pyro_client_matches(self._config.control_ips):
             return CommandStatus.InvalidControlIP
-
-        if self._engineering_mode:
-            return CommandStatus.EngineeringModeActive
 
         with self._shutter_status_lock:
             if self._heartbeat_status == HeartbeatStatus.TimedOut and self._shutter_status == ShutterStatus.Closing:
@@ -373,98 +657,6 @@ class DomeDaemon:
         return CommandStatus.Succeeded
 
 
-    def __wait_for_azimuth(self):
-        """Wait for the dome to stop rotating (or timeout)"""
-        if self._force_stopped:
-            return False
-
-        with self._azimuth_status_condition:
-            self._azimuth_status_condition.notify_all()
-
-        start_time = Time.now()
-        while True:
-            time.sleep(self._config.azimuth_moving_loop_delay)
-            runtime = (Time.now() - start_time).to_value(u.s)
-
-            with self._azimuth_status_lock:
-                if self._azimuth_status == AzimuthStatus.Idle or runtime > self._config.azimuth_move_timeout:
-                    break
-
-            if self._force_stopped:
-                try:
-                    with self._azimuth_port_lock:
-                        self._azimuth_port.write(b'STOP\r')
-                        self._azimuth_port.read_until(serial.CR)
-                except Exception as exception:
-                    log.error(self._config.log_name, 'Failed to send serial command (' + str(exception) + ')')
-                break
-
-        with self._azimuth_status_lock:
-            return not self._force_stopped and self._azimuth_status == AzimuthStatus.Idle
-
-    @Pyro4.expose
-    def home_azimuth(self, blocking=True):
-        """Home the azimuth motor"""
-        if not pyro_client_matches(self._config.control_ips):
-            return CommandStatus.InvalidControlIP
-
-        if self._azimuth_status == AzimuthStatus.Disconnected:
-            return CommandStatus.NotConnected
-
-        if self._engineering_mode:
-            return CommandStatus.EngineeringModeActive
-
-        with TryLock(self._azimuth_command_lock) as success:
-            if not success:
-                return CommandStatus.Blocked
-
-            with self._azimuth_port_lock:
-                self._azimuth_port.write(b'GO H\r')
-                self._azimuth_port.read_until(serial.CR)
-
-            self._azimuth_status = AzimuthStatus.Homing
-            if blocking and not self.__wait_for_azimuth():
-                return CommandStatus.Failed
-
-            log.info(self._config.log_name, 'Homing complete')
-            return CommandStatus.Succeeded
-
-    @Pyro4.expose
-    def park(self, blocking=True):
-        """Slew the dome to the park position"""
-        return self.slew_azimuth(self._config.park_azimuth, blocking=blocking)
-
-    @Pyro4.expose
-    def slew_azimuth(self, azimuth, blocking=True):
-        """Slew the dome to the requested azimuth"""
-        if not pyro_client_matches(self._config.control_ips):
-            return CommandStatus.InvalidControlIP
-
-        if self._azimuth_status == AzimuthStatus.Disconnected:
-            return CommandStatus.NotConnected
-
-        if self._azimuth_status == AzimuthStatus.NotHomed:
-            return CommandStatus.NotHomed
-
-        if self._engineering_mode:
-            return CommandStatus.EngineeringModeActive
-
-        with TryLock(self._azimuth_command_lock) as success:
-            if not success:
-                return CommandStatus.Blocked
-
-            with self._azimuth_port_lock:
-                self._azimuth_port.write(f'GO {float(azimuth):05.1f}\r'.encode('ascii'))
-                self._azimuth_port.read_until(serial.CR)
-
-            self._azimuth_status = AzimuthStatus.Moving
-
-            if blocking and not self.__wait_for_azimuth():
-                return CommandStatus.Failed
-
-            return CommandStatus.Succeeded
-
-
     @Pyro4.expose
     def status(self):
         """Query the latest status."""
@@ -473,7 +665,6 @@ class DomeDaemon:
                 'date': Time.now().strftime('%Y-%m-%dT%H:%M:%SZ'),
                 'shutter': self._shutter_status,
                 'shutter_label': ShutterStatus.label(self._shutter_status),
-                'engineering_mode': self._engineering_mode,
                 'closed': self._shutter_status == ShutterStatus.Closed,
                 'heartbeat_status': self._heartbeat_status,
                 'heartbeat_status_label': HeartbeatStatus.label(self._heartbeat_status),

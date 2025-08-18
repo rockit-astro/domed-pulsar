@@ -25,11 +25,12 @@ CONFIG_SCHEMA = {
     'type': 'object',
     'additionalProperties': False,
     'required': [
-        'daemon', 'log_name', 'control_machines',
+        'daemon', 'log_name', 'control_machines', 'telescope_machines',
         'azimuth_serial_port', 'azimuth_serial_baud', 'azimuth_serial_timeout',
         'shutter_serial_port', 'shutter_serial_baud', 'shutter_serial_timeout',
         'azimuth_loop_delay', 'azimuth_moving_loop_delay', 'home_azimuth', 'park_azimuth',
         'azimuth_move_timeout', 'shutter_move_timeout',
+        'latitude', 'longitude', 'altitude', 'dome_radius_cm', 'telescope_offset_x_cm', 'tracking_max_separation'
     ],
     'properties': {
         'daemon': {
@@ -40,6 +41,13 @@ CONFIG_SCHEMA = {
             'type': 'string'
         },
         'control_machines': {
+            'type': 'array',
+            'items': {
+                'type': 'string',
+                'machine_name': True
+            }
+        },
+        'telescope_machines': {
             'type': 'array',
             'items': {
                 'type': 'string',
@@ -97,6 +105,33 @@ CONFIG_SCHEMA = {
         'shutter_move_timeout': {
             'type': 'number',
             'min': 0
+        },
+
+        'latitude': {
+            'type': 'number',
+            'minimum': -90,
+            'maximum': 90
+        },
+        'longitude': {
+            'type': 'number',
+            'minimum': -180,
+            'maximum': 180
+        },
+        'altitude': {
+            'type': 'number',
+            'minimum': 0
+        },
+        'dome_radius_cm': {
+            'type': 'integer'
+        },
+        'telescope_offset_x_cm': {
+            'type': 'integer',
+            'minimum': -100,
+            'maximum': 100
+        },
+        'tracking_max_separation': {
+            'type': 'number',
+            'minimum': 0
         }
     }
 }
@@ -117,6 +152,7 @@ class Config:
         self.daemon = getattr(daemons, config_json['daemon'])
         self.log_name = config_json['log_name']
         self.control_ips = [getattr(IP, machine) for machine in config_json['control_machines']]
+        self.telescope_ips = [getattr(IP, machine) for machine in config_json['telescope_machines']]
         self.azimuth_serial_port = config_json['azimuth_serial_port']
         self.azimuth_serial_baud = config_json['azimuth_serial_baud']
         self.azimuth_serial_timeout = config_json['azimuth_serial_timeout']
@@ -129,3 +165,9 @@ class Config:
         self.azimuth_moving_loop_delay = float(config_json['azimuth_moving_loop_delay'])
         self.azimuth_move_timeout = int(config_json['azimuth_move_timeout'])
         self.shutter_move_timeout = int(config_json['shutter_move_timeout'])
+        self.latitude = float(config_json['latitude'])
+        self.longitude = float(config_json['longitude'])
+        self.altitude = float(config_json['altitude'])
+        self.dome_radius_cm = config_json['dome_radius_cm']
+        self.telescope_offset_x_cm = config_json['telescope_offset_x_cm']
+        self.tracking_max_separation = config_json['tracking_max_separation']
